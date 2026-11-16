@@ -1139,17 +1139,27 @@ def decide(record: DomainRecord, context: Mapping[str, Any] | None = None) -> De
     scorecard = record_score(record, context)
     guards = guard_report(record, context)
     critical = sum(item.severity == 'critical' for item in rules)
+    evidence = str(context.get('evidence_status', 'trusted'))
+    confidence = bounded(context.get('evidence_confidence', 1.0))
     if critical:
         outcome = 'hold'
+    elif evidence != 'trusted':
+        # 保守保留处置：既不能把失效/不足的证据当成新的可信批准，
+        # 也不能把采集失效当成低风险拒掉，统一转入人工复核等待重评。
+        outcome = 'review'
     elif scorecard['score'] >= float(context.get('approve_threshold', 0.62)) and guards['passed'] >= guards['failed']:
         outcome = 'approve'
     elif scorecard['score'] >= float(context.get('review_threshold', 0.38)):
         outcome = 'review'
     else:
         outcome = 'reject'
-    reasons = (f"score={scorecard['score']:.6f}", f"critical={critical}",
-               f"guards={guards['passed']}/{guards['passed'] + guards['failed']}")
-    return Decision(record.record_id, outcome, scorecard['score'], reasons, rules, scorecard['metrics'])
+    reasons = [f"score={scorecard['score']:.6f}", f"critical={critical}",
+               f"guards={guards['passed']}/{guards['passed'] + guards['failed']}",
+               f"evidence={evidence}", f"confidence={confidence:.6f}"]
+    advisory = context.get('alert_advisory')
+    if advisory and evidence != 'trusted':
+        reasons.append(str(advisory))
+    return Decision(record.record_id, outcome, scorecard['score'], tuple(reasons), rules, scorecard['metrics'])
 
 def advance_for_outcome(record: DomainRecord, decision: Decision) -> DomainRecord:
     current = STATES.index(record.state)

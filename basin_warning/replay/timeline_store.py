@@ -7,8 +7,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-from basin_warning.observations.hydro_event import Decision, DomainRecord, ContractError, canonical_json, stable_hash, utc_now
-from basin_warning.alerts.notification_ledger import prepare_notifications, register_reach, assign_station, issue_notice, update_notice, reach_notices
+from basin_warning.observations.hydro_event import Decision, DomainRecord, ContractError, RuleResult, canonical_json, stable_hash, utc_now
+from basin_warning.alerts.notification_ledger import (prepare_notifications, register_reach, assign_station,
+                                                      issue_notice, update_notice, reach_notices,
+                                                      pending_notices, supersede_pending_notices)
 
 
 SCHEMA = """
@@ -106,6 +108,14 @@ class Repository:
         with self.connect() as connection:
             return reach_notices(connection, reach_id)
 
+    def pending_notices(self, reach_id: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            return pending_notices(connection, reach_id)
+
+    def supersede_pending_notices(self, observation_id: str, current_version: int) -> list[dict[str, Any]]:
+        with self.transaction() as connection:
+            return supersede_pending_notices(connection, observation_id, current_version)
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
@@ -143,24 +153,28 @@ class Repository:
             raise ContractError("conflicting event replay") from None
         return event_hash
 
+    def _store_record(self, connection: sqlite3.Connection, record: DomainRecord,
+                      expected_version: int | None = None) -> str:
+        current = connection.execute("SELECT version,fingerprint FROM records WHERE record_id=?", (record.record_id,)).fetchone()
+        if current and expected_version is not None and current[0] != expected_version:
+            raise ContractError("optimistic version conflict")
+        if current and current[1] == record.fingerprint:
+            return record.fingerprint
+        if current and record.version <= current[0]:
+            raise ContractError("record version must advance")
+        payload = canonical_json(record.payload)
+        connection.execute("INSERT INTO records(record_id,version,state,payload_json,fingerprint,occurred_at,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET version=excluded.version,state=excluded.state,payload_json=excluded.payload_json,fingerprint=excluded.fingerprint,occurred_at=excluded.occurred_at,source=excluded.source,updated_at=excluded.updated_at",
+                           (record.record_id, record.version, record.state, payload, record.fingerprint,
+                            record.occurred_at, record.source, utc_now()))
+        connection.execute("INSERT INTO record_versions(record_id,version,state,payload_json,fingerprint,stored_at) VALUES(?,?,?,?,?,?)",
+                           (record.record_id, record.version, record.state, payload, record.fingerprint, utc_now()))
+        self.append_event(connection, "record.saved", record.record_id, record.version,
+                          {"state": record.state, "fingerprint": record.fingerprint})
+        return record.fingerprint
+
     def save_record(self, record: DomainRecord, expected_version: int | None = None) -> str:
         with self.transaction() as connection:
-            current = connection.execute("SELECT version,fingerprint FROM records WHERE record_id=?", (record.record_id,)).fetchone()
-            if current and expected_version is not None and current[0] != expected_version:
-                raise ContractError("optimistic version conflict")
-            if current and current[1] == record.fingerprint:
-                return record.fingerprint
-            if current and record.version <= current[0]:
-                raise ContractError("record version must advance")
-            payload = canonical_json(record.payload)
-            connection.execute("INSERT INTO records(record_id,version,state,payload_json,fingerprint,occurred_at,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET version=excluded.version,state=excluded.state,payload_json=excluded.payload_json,fingerprint=excluded.fingerprint,occurred_at=excluded.occurred_at,source=excluded.source,updated_at=excluded.updated_at",
-                               (record.record_id, record.version, record.state, payload, record.fingerprint,
-                                record.occurred_at, record.source, utc_now()))
-            connection.execute("INSERT INTO record_versions(record_id,version,state,payload_json,fingerprint,stored_at) VALUES(?,?,?,?,?,?)",
-                               (record.record_id, record.version, record.state, payload, record.fingerprint, utc_now()))
-            self.append_event(connection, "record.saved", record.record_id, record.version,
-                              {"state": record.state, "fingerprint": record.fingerprint})
-            return record.fingerprint
+            return self._store_record(connection, record, expected_version)
 
     def get_record(self, record_id: str) -> DomainRecord | None:
         with self.connect() as connection:
@@ -184,18 +198,55 @@ class Repository:
                              state=row["state"], version=row["version"], occurred_at=row["occurred_at"],
                              source=row["source"]) for row in rows]
 
-    def save_decision(self, decision: Decision) -> str:
+    @staticmethod
+    def _decision_content_hash(decision_json: Mapping[str, Any]) -> str:
+        content = dict(decision_json)
+        content.pop("decided_at", None)
+        return stable_hash(content)
+
+    def _insert_decision(self, connection: sqlite3.Connection, decision: Decision) -> str:
+        if not connection.execute("SELECT 1 FROM records WHERE record_id=?", (decision.record_id,)).fetchone():
+            raise ContractError("decision record does not exist")
+        content_hash = self._decision_content_hash(decision.as_dict())
+        rows = connection.execute("SELECT decision_id,decision_json FROM decisions WHERE record_id=?",
+                                  (decision.record_id,)).fetchall()
+        for row in rows:
+            if self._decision_content_hash(json.loads(row["decision_json"])) == content_hash:
+                # 重复上报/重放/重启：同一依据得出同一处置，直接复用既有决定，不重复处置
+                return row["decision_id"]
         decision_id = decision.fingerprint
-        with self.transaction() as connection:
-            if not connection.execute("SELECT 1 FROM records WHERE record_id=?", (decision.record_id,)).fetchone():
-                raise ContractError("decision record does not exist")
-            body = canonical_json(decision.as_dict())
-            connection.execute("INSERT OR IGNORE INTO decisions(decision_id,record_id,outcome,score,decision_json,decided_at) VALUES(?,?,?,?,?,?)",
-                               (decision_id, decision.record_id, decision.outcome, decision.score, body, decision.decided_at))
-            self.append_event(connection, "decision.saved", decision.record_id,
-                              self.event_count(decision.record_id, connection) + 1,
-                              {"decision_id": decision_id, "outcome": decision.outcome, "score": decision.score})
+        body = canonical_json(decision.as_dict())
+        connection.execute("INSERT OR IGNORE INTO decisions(decision_id,record_id,outcome,score,decision_json,decided_at) VALUES(?,?,?,?,?,?)",
+                           (decision_id, decision.record_id, decision.outcome, decision.score, body, decision.decided_at))
+        self.append_event(connection, "decision.saved", decision.record_id,
+                          self.event_count(decision.record_id, connection) + 1,
+                          {"decision_id": decision_id, "outcome": decision.outcome, "score": decision.score})
         return decision_id
+
+    def save_decision(self, decision: Decision) -> str:
+        with self.transaction() as connection:
+            return self._insert_decision(connection, decision)
+
+    def save_disposition(self, decision: Decision, record: DomainRecord,
+                         expected_version: int | None = None) -> dict[str, str]:
+        """决定与状态推进在同一事务落库：重启后不会出现只有决定没有推进、
+        或重复推进的矛盾中间态。"""
+        with self.transaction() as connection:
+            decision_id = self._insert_decision(connection, decision)
+            fingerprint = self._store_record(connection, record, expected_version)
+        return {"decision_id": decision_id, "fingerprint": fingerprint}
+
+    def latest_decision(self, record_id: str) -> Decision | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT decision_json FROM decisions WHERE record_id=? ORDER BY decided_at DESC, decision_id DESC LIMIT 1",
+                (record_id,)).fetchone()
+        if not row:
+            return None
+        value = json.loads(row["decision_json"])
+        rules = tuple(RuleResult(**item) for item in value["rules"])
+        return Decision(value["record_id"], value["outcome"], value["score"],
+                        tuple(value["reasons"]), rules, value["metrics"], value["decided_at"])
 
     def event_count(self, aggregate_id: str, connection: sqlite3.Connection | None = None) -> int:
         owns = connection is None

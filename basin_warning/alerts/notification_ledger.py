@@ -89,3 +89,34 @@ def reach_notices(connection: sqlite3.Connection, reach_id: str) -> list[dict[st
     prepare_notifications(connection)
     return [dict(row) for row in connection.execute(
         "SELECT * FROM alert_notices WHERE reach_id=? ORDER BY issued_at,notice_id", (reach_id,))]
+
+
+def pending_notices(connection: sqlite3.Connection, reach_id: str | None = None) -> list[dict[str, Any]]:
+    prepare_notifications(connection)
+    query = "SELECT * FROM alert_notices WHERE status='pending'"
+    params: tuple[Any, ...] = ()
+    if reach_id is not None:
+        query += " AND reach_id=?"
+        params = (reach_id,)
+    query += " ORDER BY issued_at,notice_id"
+    return [dict(row) for row in connection.execute(query, params)]
+
+
+def supersede_pending_notices(connection: sqlite3.Connection, observation_id: str,
+                              current_version: int) -> list[dict[str, Any]]:
+    """迟到更正后按同一依据重评：仍绑定旧观测版本的待发通知予以取消，
+    值班员可依据新版本重新签发；已送达/已确认的事实一律保留。
+    重复调用幂等，不会重复取消或触碰已送达/已确认通知。"""
+    prepare_notifications(connection)
+    stale = connection.execute(
+        "SELECT notice_id FROM alert_notices WHERE observation_id=? AND status='pending' AND observation_version<>? ORDER BY notice_id",
+        (observation_id, current_version)).fetchall()
+    cancelled: list[dict[str, Any]] = []
+    for row in stale:
+        changed = connection.execute(
+            "UPDATE alert_notices SET status='cancelled' WHERE notice_id=? AND status='pending'",
+            (row["notice_id"],)).rowcount
+        if changed:
+            cancelled.append(dict(connection.execute(
+                "SELECT * FROM alert_notices WHERE notice_id=?", (row["notice_id"],)).fetchone()))
+    return cancelled
